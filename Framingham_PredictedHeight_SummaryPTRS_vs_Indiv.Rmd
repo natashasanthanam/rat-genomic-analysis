@@ -1,0 +1,461 @@
+---
+title: "Comparison of Prediction Performance of Summary vs Individual PTRS using the Framingham cohort"
+author: "Natasha Santhanam"
+date: "12/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(qqman)
+library(arrow)
+library(RSQLite)
+library(glmnet)
+library(GenomicRanges)
+library(liftOver)
+library(ggpubr)
+"%&%" = function(a,b) paste(a,b,sep="")
+dir <- "/Users/natashasanthanam/Github/rat-genomic-analysis/data/"
+```
+
+## Compare Predicted Height to Observed Height in the Framingham Data for both Individual and Summary PTRS
+
+
+# First we have to calculate predicted expression in the Framingham data
+
+dont have rsids so will have to use on the fly mapping
+```{bash calculate predicted expression in Framingham, eval=FALSE}
+#!/bin/bash
+
+#PBS -N Framingham_$TISSUE_prediXcan
+#PBS -S /bin/bash
+#PBS -l walltime=48:00:00
+#PBS -l nodes=4:ppn=2
+
+#PBS -l mem=18gb
+
+
+#PBS -o /gpfs/data/im-lab/nas40t2/natasha/rat_genomics/PTRS_weights/logs/Framingham__$TISSUE.out
+#PBS -e /gpfs/data/im-lab/nas40t2/natasha/rat_genomics/PTRS_weights/logs/Framingham__$TISSUE.err
+
+source ~/.bashrc
+source ~/.bash_profile
+conda activate /gpfs/data/im-lab/nas40t2/yanyul/softwares/miniconda2/envs/imlabtools/
+
+export METAXCAN=/gpfs/data/im-lab/nas40t2/natasha/GTEX_Analysis/MetaXcan/software
+export GENO=/gpfs/data/im-lab/nas40t2/Data/dbGaP/Transcriptome/Framingham/imputed_hrc1.1
+export MODEL=/gpfs/data/im-lab/nas40t2/Data/PredictDB/GTEx_v8/models_v1/eqtl/ctimp
+export RESULTS=/gpfs/data/im-lab/nas40t2/natasha/rat_genomics/PTRS_weights/PGP
+export DATA=/gpfs/data/im-lab/nas40t2/natasha/GTEX_Analysis/predixcan
+
+printf "Predict expression\n\n"
+
+python3 $METAXCAN/Predict.py \
+--model_db_path $MODEL/ctimp_$TISSUE.db \
+--model_db_snp_key varID \
+--vcf_genotypes $GENO/chr*.dose.vcf.gz  \
+--vcf_mode genotyped \
+--liftover $DATA/hg19ToHg38.over.chain.gz  \
+--on_the_fly_mapping METADATA "chr{}_{}_{}_{}_b38" \
+--prediction_output $RESULTS/Framingham__$TISSUE.predict.txt \
+--prediction_summary_output $RESULTS/Framingham__$TISSUE.summary.txt \
+--verbosity 9 \
+--throw
+
+```
+
+
+```{bash run prediXcan, eval=FALSE}
+tissue=Whole_Blood
+qsub -v TISSUE=$tissue Framingham_prediXcan.pbs
+```
+
+#Calculate Predicted Height using Summary PTRS weights and Predicted Expression from above
+
+Will use the PTRS weights that were made with Whole Blood
+```{r file dir, eval=FALSE}
+data.dir <- "/gpfs/data/im-lab/nas40t2/natasha/rat_genomics/"
+```
+
+# Match genes in weights file in humans to predicted expression in Framingham
+```{r read in weights and expression for Framingham, eval=FALSE}
+weights <- read_tsv(data.dir %&% "PTRS_weights/weight_files/spxcan2ptrs_original_scale.Standing_height.Whole_Blood.weights.tsv")
+weights <- read_tsv(data.dir %&% "PTRS_weights/weight_files/pxcan2ptrs_clump.Standing_height.Whole_Blood.weights.tsv")
+
+# Here we use predicted expression not predicted and make sure to use human ensembl id gene name
+pred_expr <- read_tsv(data.dir %&% "PTRS_weights/Framingham/Framingham_less_mem__Whole_Blood.predict.txt") %>% select(-c(FID))
+```
+
+# Generate predicted values for Height using all models 
+```{r generate predicted trait, eval=FALSE}
+fn_generate_trait = function(exp, weights)
+  {
+   nsample = length(exp$ID)
+   nmodels = ncol(weights) - 1
+   pred_height <- matrix(0, nrow = nsample, ncol = nmodels)
+   if(ncol(exp)-1 != nrow(weights)) {
+     weights <- weights[na.omit(match(colnames(exp), weights$gene)),]
+     expr <- exp[, intersect(colnames(exp), weights$gene)]
+     expr <- expr %>%  mutate(ID = exp$IID, .before = colnames(expr)[1])
+   } 
+   for(i in 1:nmodels) {
+     c1 <- as.matrix(weights[,i+1])
+     for(j in 1:nsample) {
+       df <- as.matrix(exp[j, 2:ncol(exp)])
+       pred_height[j,i] <- df %*% c1
+     }
+   }
+   rownames(pred_height) <- exp$ID
+   colnames(pred_height) <- colnames(weights)[2:ncol(weights)]
+}
+```
+
+
+#Create Pheno File by finding all Height Values for all datsets in Framingham
+
+Scrape NCBI website for height related phenotypes
+```{python read in phenos, eval=FALSE}
+import pandas as pd
+
+pheno = pd.read_html('https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/GetListOfAllObjects.cgi?study_id=phs000007.v32.p13&object_type=variable')[0]
+
+pheno.to_csv('/gpfs/data/im-lab/nas40t2/natasha/rat_genomics/PTRS_weights/PGP/Framingham_list_all_phenotypes.csv', index=False)
+```
+
+Select Height related variables
+```{r find height variables, eval=FALSE}
+pheno <- read_csv(data.dir %&% "/PTRS_weights/Framingham/Framingham_list_all_phenotypes.csv")
+
+vars <- pheno %>% filter(grepl('HEIGHT', `Variable description`))  %>% filter(!grepl('KNEE|SITTING|PROTOCOL|FRAC|CHAIR|ESTIMATED|CM|MASS|EXCESS', `Variable description`))
+ids <- vars$`Variable name`
+```
+
+Find all Height variables in Phenotype Files in CRI
+```{r create pheno file, eval=FALSE}
+dir <- "/gpfs/data/im-lab/nas40t2/Data/Framingham/40031/PhenoGenotypeFiles/RootStudyConsentSet_phs000007.Framingham.v23.p8.c1.HMB-IRB-MDS/PhenotypeFiles/"
+
+filelist <- list.files(dir, pattern= ".txt.gz", full.names = TRUE)
+
+full_pheno <- data.frame(shareid = as.character())
+
+for(fila in filelist) {
+  tempo <- fread(fila,header = TRUE) 
+  colnames(tempo) = as.character(tempo[1,])
+  if("shareid" %in% colnames(tempo)) {
+  tempo <- tempo[2:nrow(tempo),] %>% select(c(shareid, any_of(ids)))
+  if(ncol(tempo) >= 2) {
+    full_pheno <- full_join(tempo, full_pheno, by=c("shareid"))
+  }
+  }
+}
+
+full_pheno <- as.data.frame(full_pheno %>% select(c(shareid, intersect(colnames(full_pheno), ids))))
+```
+
+
+Transform certain columns so that are all on the same scale
+```{r transform pheno, eval=FALSE}
+change_vars <- vars %>% filter(grepl('DIVIDE|LOWER QUARTER', `Variable description`)) %>% select(c(`Variable name`))
+change_vars <- append("FJ361", change_vars$`Variable name`)
+
+pheno_matrix <- as.matrix(full_pheno[,2:ncol(full_pheno)])
+pheno_matrix <- apply(pheno_matrix, 2, as.numeric)
+
+pheno_matrix[,match(change_vars, colnames(pheno_matrix))] <- pheno_matrix[,match(change_vars, colnames(pheno_matrix))]/100
+
+#can even check if all columns are in the same scale
+apply(pheno_matrix, 2, function(x) mean(x, na.rm=TRUE))
+```
+
+
+
+Find Average Height across all Individuals
+```{r create avg pheno, eval=FALSE}
+pheno_matrix <- cbind(apply(pheno_matrix, 1, function(x) mean(x, na.rm=TRUE)), pheno_matrix)
+obs_height <- as.data.frame(pheno_matrix) %>% rename(avg_height = V1) %>% mutate(shareid = full_pheno$shareid, .before = avg_height)
+rownames(obs_height) = obs_height$shareid
+```
+
+#Factor out Sex from observed data
+
+Generate list of all sex variables in our phenotype data
+```{r find all sex variables, eval=FALSE}
+pheno <- read_csv(data.dir %&% "/PTRS_weights/Framingham/Framingham_list_all_phenotypes.csv")
+
+vars <- pheno %>% filter(grepl('SEX|Gender|gender', `Variable description`))  %>% filter(!grepl('THINKING|BAD|SLIT', `Variable description`))
+sex_ids <- vars$`Variable name`
+```
+
+ Find corresponding sex phenotypes in our pheno files in CRI
+```{r find corresponding vars in pheno files, eval=FALSE}
+dir <- "/gpfs/data/im-lab/nas40t2/Data/Framingham/40031/PhenoGenotypeFiles/RootStudyConsentSet_phs000007.Framingham.v23.p8.c1.HMB-IRB-MDS/PhenotypeFiles/"
+
+filelist <- list.files(dir, pattern= ".txt.gz", full.names = TRUE)
+
+full_pheno <- data.frame(shareid = as.character())
+
+for(fila in filelist) {
+  tempo <- fread(fila,header = TRUE) 
+  colnames(tempo) = as.character(tempo[1,])
+  if("shareid" %in% colnames(tempo)) {
+  tempo <- tempo[2:nrow(tempo),] %>% select(c(shareid, any_of(sex_ids)))
+  if(ncol(tempo) >= 2) {
+    full_pheno <- full_join(tempo, full_pheno, by=c("shareid"))
+  }
+  }
+}
+obs_height <- full_join(full_pheno, obs_height, by = "shareid")
+```
+ 
+Regress out sex from observed height
+```{r regress out sex, eval=FALSE}
+obs_pheno <- obs_height %>% select(c(shareid, G3A440, avg_height))
+obs_pheno <- na.omit(obs_pheno)
+
+fit = lm(obs_pheno$avg_height ~ obs_pheno$G3A440)
+obs_pheno <-  obs_pheno %>% mutate(height_rg = fit$residuals)
+```
+
+
+#Compare Predicted vs Observed Height
+First in Clump
+```{r read in  clump files, eval=FALSE}
+pred_height <- readRDS(data.dir %&% "/PTRS_weights/Framingham/Framingham_Whole_Blood_clump_predicted_height.RDS")
+
+weights <- weights %>% select(-c(gene_name))
+n_genes  <- as.matrix(apply(weights, 2, function(x) sum(x != 0 )))
+```
+
+
+Filter for individuals in predicted height and observed height
+```{r filter individuals for clump, eval=FALSE}
+tempo <- pred_height[na.omit(match(obs_pheno$shareid, rownames(pred_height))),]
+
+pheno_height <- obs_pheno[na.omit(match(rownames(pred_height), obs_pheno$shareid)),]
+pheno_height <- pheno_height[match(rownames(tempo), pheno_height$shareid),]
+```
+
+Create Correlation Matrix
+
+```{r corr matrix for clump, eval=FALSE}
+Framingahm_height_clump <- data.frame(estimate = numeric(), pvalue = numeric(), model = character(), n.genes = numeric(), conf.int.min = numeric(), conf.int.max = numeric())
+
+for(i in 1:ncol(tempo)){
+  Framingahm_height_clump[i,1] <- cor.test(pheno_height$height_rg, tempo[,i])$estimate
+  Framingahm_height_clump[i,2] <- cor.test(pheno_height$height_rg, tempo[,i])$p.value
+  Framingahm_height_clump[i,3] <- colnames(tempo)[i]
+  Framingahm_height_clump[i,4] <- n_genes[i]
+  Framingahm_height_clump[i,5] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[1]
+  Framingahm_height_clump[i,6] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[2]
+}
+```
+
+
+Do the same for original scale no clumping
+```{r read in files for lasso, eval=FALSE}
+pred_height <- readRDS(data.dir %&% "/PTRS_weights/Framingham/Framingham_Whole_Blood_original_predicted_height.RDS")
+
+weights <- read_tsv(data.dir %&% "PTRS_weights/weight_files/spxcan2ptrs_original_scale.Standing_height.Whole_Blood.weights.tsv") %>% select(-c(gene_name))
+n_genes  <- as.matrix(apply(weights, 2, function(x) sum(x != 0 )))
+```
+
+
+Filter for individuals in predicted height and observed height
+```{r filter lass ind, eval=FALSE}
+tempo <- pred_height[na.omit(match(obs_pheno$shareid, rownames(pred_height))),]
+
+pheno_height <- obs_pheno[na.omit(match(rownames(pred_height), obs_pheno$shareid)),]
+pheno_height <- pheno_height[match(rownames(tempo), pheno_height$shareid),]
+```
+
+Create Correlation Matrix
+
+```{r corr matrix for lasso, eval=FALSE}
+Framingahm_height_lasso <- data.frame(estimate = numeric(), pvalue = numeric(), model = character(), n.genes = numeric(), conf.int.min = numeric(), conf.int.max = numeric())
+
+for(i in 1:ncol(tempo)){
+  Framingahm_height_lasso[i,1] <- cor.test(pheno_height$height_rg, tempo[,i])$estimate
+  Framingahm_height_lasso[i,2] <- cor.test(pheno_height$height_rg, tempo[,i])$p.value
+  Framingahm_height_lasso[i,3] <- colnames(tempo)[i]
+  Framingahm_height_lasso[i,4] <- n_genes[i]
+  Framingahm_height_lasso[i,5] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[1]
+  Framingahm_height_lasso[i,6] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[2]
+}
+```
+
+# Calcualte Predicted Height using Individual level PTRS
+
+```{r read in ind weights, eval=FALSE}
+weights <- read_tsv(data.dir %&% "PTRS_weights/weight_files/elastic_net_alpha_0.1_British.export_model/weights.height.tsv.gz") 
+```
+
+```{r calculate predicted height in individual level PTRS, eval=FALSE}
+ind_height <- fn_generate_trait(expr, weights)
+```
+
+
+```{r calc genes per model, eval=FALSE}
+weights <- weights %>% select(-c(gene_id))
+n_genes = as.matrix(apply(weights, 2, function(x) sum(x != 0 )))
+```
+
+
+```{r calculate corr for ind height, eval=FALSE}
+tempo <- ind_height[na.omit(match(obs_pheno$shareid, rownames(ind_height))),]
+
+pheno_height <- obs_pheno[na.omit(match(rownames(ind_height), obs_pheno$shareid)),]
+pheno_height <- pheno_height[match(rownames(tempo), pheno_height$shareid),]
+
+ind_height <- data.frame(estimate = numeric(), pvalue = numeric(), model = character(), n.genes = numeric(), conf.int.min = numeric(), conf.int.max = numeric())
+ 
+for(i in 1:ncol(tempo)){
+  ind_height[i,1] <- cor.test(pheno_height$height_rg, tempo[,i])$estimate
+  ind_height[i,2] <- cor.test(pheno_height$height_rg, tempo[,i])$p.value
+  ind_height[i,3] <- colnames(tempo)[i]
+  ind_height[i,4] <- n_genes[i]
+  ind_height[i,5] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[1]
+  ind_height[i,6] <- cor.test(pheno_height$height_rg, tempo[,i])$conf.int[2]
+}
+```
+
+
+# Run PRSice
+Generate Geno files for Framingham
+```{bash}
+for i in $(seq 1 22); do
+plink --vcf chr$i.dose.vcf.gz --geno 0.02 --mind 0.02 --maf 0.05 --allow-no-sex --make-bed --out plink_files/chr$i ;
+done
+```
+
+Match SNPs between base and target files
+```{r}
+gwas = fread(imputeb_gwas)
+gwas$chromosome = as.numeric(substr(gwas$chromosome, 4, str_length(gwas$chromosome)))
+gwas <- gwas %>% mutate(snpid = paste(gwas$chromosome, gwas$position, sep=":"), .before = chromosome)
+fwrite(gwas, "/scratch/nsanthanam1/Lassosum_PTRS/geno_cov/run_gtex_gwas_eur/imputed_PRSice.Standing_height.gz", sep="\t")
+```
+
+```{bash}
+imputeb_gwas=/scratch/nsanthanam1/Lassosum_PTRS/geno_cov/run_gtex_gwas_eur/imputed_PRSice.Standing_height.gz
+geno=/gpfs/data/im-lab/nas40t2/Data/dbGaP/Transcriptome/Framingham/imputed_hrc1.1/plink_files
+```
+
+```{r create phenotype file, eval=FALSE}
+filelist <- list.files("/gpfs/data/im-lab/nas40t2/Data/dbGaP/Transcriptome/Framingham/imputed_hrc1.1/plink_files", pattern = ".fam", full.names=TRUE)
+
+pheno <- data.frame(FID = as.integer(), IID = as.integer())
+
+for(fila in filelist) {
+  tempo <- fread(fila) %>% rename(FID = V1) %>% rename(IID = V2) %>% select(c(FID, IID))
+  pheno <- full_join(tempo, pheno, by = c("FID", "IID"))
+}
+
+height <-  read_tsv("/gpfs/data/im-lab/nas40t2/natasha/rat_genomics/PTRS_weights/Framingham/regressed_height_pheno.txt", col_names = TRUE) %>% rename(FID = shareid)
+
+pheno <- full_join(pheno, height, by = "FID") %>% select(c(FID, IID, avg_height, height_rg))
+#write_tsv(pheno, "/scratch/nsanthanam1/Lassosum_PTRS/geno_cov/run_gtex_gwas_eur/PRSice_Framingham_pheno.txt", col_names = FALSE)
+```
+
+```{bash}
+ PRSice --base $imputeb_gwas \
+    --snp snpid \
+    --chr chromosome \
+    --bp position \
+    --A1 effect_allele \
+    --A2 non_effect_allele \
+    --pvalue pvalue \
+    --binary-target F \
+    --beta \
+    --stat effect_size \
+    --extract Framingham_PRSice.valid \
+    --target $geno/chr#  \
+    --pheno PRSice_Framingham_pheno.txt \
+    --out Framingham_PRSice_rg
+```
+
+
+Check Correlation between observed height and PRS from PRSice
+
+```{r read in weights and expression for Framingham, eval=FALSE}
+weights <- fread(out.dir %&% "Framingham_PRSice_rg.best")
+obs_pheno <- read_tsv(data.dir %&% "PTRS_weights/Framingham/regressed_height_pheno.txt", col_names = TRUE)
+```
+
+```{r corrleation with PRSice, eval=FALSE}
+tempo <- weights[na.omit(match(obs_pheno$shareid, weights$FID)),]
+
+pheno_height <- obs_pheno[na.omit(match(tempo$FID, obs_pheno$shareid)),]
+pheno_height <- pheno_height[match(tempo$FID, pheno_height$shareid),]
+
+PRSice_height <- data.frame(estimate = numeric(), pvalue = numeric(), conf.int.min = numeric(), conf.int.max = numeric() )
+ 
+  PRSice_height[1,1] <- cor.test(pheno_height$height_rg, tempo$PRS)$estimate
+  PRSice_height[1,2] <- cor.test(pheno_height$height_rg, tempo$PRS)$p.value
+  PRSice_height[1,3] <- cor.test(pheno_height$height_rg, tempo$PRS)$conf.int[1]
+  PRSice_height[1,4] <- cor.test(pheno_height$height_rg, tempo$PRS)$conf.int[2]
+```
+
+ 
+# Naive PTRS - using zscores from S-PrediXcan results as weights
+
+Predict Height with Weights from S-PrediXcan using Whole Blood and UKB GWAS
+```{r read SPredixcan, eval=FALSE}
+spred_weights <- fread(out.dir %&% "spredixcan.Standing_height.Whole_Blood.csv") %>% select(c(gene, zscore))
+pred_expr <- read_tsv(data.dir %&% "PTRS_weights/Framingham/Framingham_less_mem__Whole_Blood.predict.txt") %>% select(-c(FID))
+```
+
+```{r generate pred height with naive SPTRS, eval=FALSE}
+naive_pred_height <- as.data.frame(fn_generate_trait(spred_weights, pred_expr))
+```
+
+Check Correlation between observed height and naive PTRS pred height
+
+```{r corrleation with PRSice, eval=FALSE}
+naive_pred_height <- naive_pred_height %>% mutate(ID = rownames(naive_pred_height))
+tempo <- naive_pred_height[na.omit(match(obs_pheno$shareid, naive_pred_height$ID)),]
+
+pheno_height <- obs_pheno[na.omit(match(tempo$ID, obs_pheno$shareid)),]
+pheno_height <- pheno_height[match(tempo$ID, pheno_height$shareid),]
+
+naive_height <- data.frame(estimate = numeric(), pvalue = numeric(), conf.int.min = numeric(), conf.int.max = numeric() )
+ 
+  naive_height[1,1] <- cor.test(pheno_height$height_rg, tempo$zscore)$estimate
+  naive_height[1,2] <- cor.test(pheno_height$height_rg, tempo$zscore)$p.value
+  naive_height[1,3] <- cor.test(pheno_height$height_rg, tempo$zscore)$conf.int[1]
+  naive_height[1,4] <- cor.test(pheno_height$height_rg, tempo$zscore)$conf.int[2]
+```
+
+#Create Figures to Compare Summary vs PRSice vs Individual  vs naive PTRS
+
+Read in correlation matrix for clump, lasso and Individual
+```{r read in all corr matrices }
+clump_corr <- readRDS("/Users/natashasanthanam/CRI/clump_cor.matrix_pred_height.RDS")
+lasso_corr <- readRDS("/Users/natashasanthanam/CRI/lassosum_cor.matrix_pred_height.RDS")
+indiv_corr <- readRDS("/Users/natashasanthanam/CRI/indiv_compare_pred_obs_height.RDS")
+```
+
+Correlation Matrix when sex is regressed out
+
+```{r read in all corr matrices when sex is regressed out}
+clump_corr <- readRDS("/Users/natashasanthanam/CRI/clump_cor.matrix_sex_regressed_height.RDS")
+lasso_corr <- readRDS("/Users/natashasanthanam/CRI/lassosum_cor.matrix_sex_regressed_pred_height.RDS")
+indiv_corr <- readRDS("/Users/natashasanthanam/CRI/indiv_compare_sex_regresed_pred_height.RDS")
+
+PRSice_corr <- readRDS("/Users/natashasanthanam/CRI/PRSice_cor.matrix_sex_regressed_height.RDS")
+naive_corr <- readRDS("/Users/natashasanthanam/CRI/naive_PTRS_cor.matrix_sex_regressed_height.RDS") %>% mutate (n.genes = 7673)
+```
+
+
+Create Plots for Performance
+```{r plot estimate}
+p1 = ggplot(clump_corr, aes(n.genes, estimate))  geom_errorbar(aes(ymin = conf.int.min, ymax = conf.int.max), width=5,  color="gray") + geom_point(color = "darkblue", position="jitter") + geom_line(color = "darkblue")  + xlab("Number of genes in each model") + ylab("Correlation Coefficient (r)") + ggtitle("Performance using Clumping Summary PTRS")
+
+p2 = ggplot(lasso_corr, aes(n.genes, estimate)) + geom_errorbar(aes(ymin = conf.int.min, ymax = conf.int.max), width=5,  color="gray") + geom_point(color = "darkblue", position="jitter") + geom_line(color = "darkblue")  + xlab("Number of genes in each model") + ylab("Correlation Coefficient (r)") + ggtitle("Performance using Lasso Summary PTRS")
+
+p3 = ggplot(indiv_corr, aes(n.genes, estimate)) + geom_point(aes(naive_corr$n.genes, naive_corr$estimate), color = "magenta") + geom_errorbar(aes(ymin = conf.int.min, ymax = conf.int.max), width=5,  color="gray") + geom_point(color = "darkblue", position="jitter") + geom_line(color = "darkblue")  + xlab("Number of genes in each model") + ylab("Correlation Coefficient (r)") + ggtitle("Performance using Individual PTRS")
+
+ggarrange(p1, p2, p3, ncol = 2, nrow = 2)
+```
+
